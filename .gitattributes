@@ -1,0 +1,3 @@
+# Keep the Windows (CRLF) line endings exactly as committed
+*.ps1 -text
+*.txt -text
