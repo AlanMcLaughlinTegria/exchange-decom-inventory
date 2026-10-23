@@ -48,6 +48,15 @@
     Skip the IIS log analysis.
 .PARAMETER SkipRemoteServers
     Read log files on this server only.
+.PARAMETER SkipHttpProxyLogs
+    Skip the HttpProxy log analysis (which mailbox each Autodiscover, MAPI, EWS,
+    RPC/HTTP and ActiveSync request was for).
+.PARAMETER TrustedForest
+    Extra forest names to check for Exchange objects, Autodiscover SCPs and SCP
+    pointers. Forests with a trust to this one are checked automatically.
+.PARAMETER ForestCredential
+    Credential for reading other forests (only needed when the trust does not
+    let the current account read their configuration partition).
 .PARAMETER NoZip
     Leave the output folder unzipped.
 
@@ -57,6 +66,28 @@
     .\Get-ExchOnPremDecomInventory.ps1 -TrackingDays 30 -IisDays 30
 
 .NOTES
+    Version 1.2
+      Added
+      - Topology-ForestExchangePresence / -ForestSCPs: Exchange organizations, servers, Autodiscover
+        SCPs and SCP pointers in every trusted forest, and the tenant each Entra Connect account syncs to.
+      - Evidence-HttpProxy-ByUserTarget / -ByTarget: which mailbox each Autodiscover, MAPI, EWS, RPC/HTTP
+        and ActiveSync request opened (shows remote public-folder and delegate access), all servers.
+      - Evidence-ReceiveConnectorUsage: every receive connector with its client sessions, mail and
+        accepted messages in the protocol-log window, including connectors with none.
+      - Evidence-MessageTracking-OutcomeBySource: per original sender IP, how many messages were
+        delivered, sent on, or failed, with the failed recipients and reason.
+      - SMTP protocol log sources now carry recipients, accepted/rejected counts and a source class
+        (health probe, Exchange server, client).
+      - Recipients-PublicFolderStatistics / -PublicFolderPermissions: per-folder size, items, dates and
+        non-default permissions.
+      - Topology-NamespaceCheck: every Exchange host name with its internal and public addresses, flagging
+        names that resolve to the DAG cluster IP and public wildcard records.
+      - Findings: rule-based summary of what the evidence shows (unused connectors, failing relay sources,
+        namespace on the DAG IP, other Exchange orgs, multiple tenants, Hybrid Agent location, system
+        mailboxes on dismounted databases, remote public-folder access).
+      Changed
+      - Hybrid Agent detection checks every Exchange server, not only the local one.
+      - Evidence-HttpProxyLogs-Depth covers all servers.
     Version 1.1
       Fixed
       - Admin audit log depth summary failed at run time ("The term 'if' is not recognized").
@@ -93,6 +124,9 @@ param(
     [switch]$SkipProtocolLogs,
     [switch]$SkipIisLogs,
     [switch]$SkipRemoteServers,
+    [switch]$SkipHttpProxyLogs,
+    [string[]]$TrustedForest,
+    [pscredential]$ForestCredential,
     [switch]$NoZip
 )
 
@@ -100,7 +134,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 $WarningPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
-$script:ScriptVersion = '1.1'
+$script:ScriptVersion = '1.2'
 $script:StartTime = Get-Date
 
 # ---------------------------------------------------------------------------
@@ -294,6 +328,84 @@ function Get-AccountDisabled {
     return ("$($User.UserAccountControl)" -match 'AccountDisabled').ToString()
 }
 
+# Splits one comma-separated log line, honouring "quoted, fields" (HttpProxy logs quote some values)
+function Split-CsvLine {
+    param([string]$Line)
+    if ($Line.IndexOf('"') -lt 0) { return , $Line.Split(',') }
+    $out = New-Object System.Collections.Generic.List[string]
+    $i = 0; $n = $Line.Length
+    while ($i -le $n) {
+        if ($i -lt $n -and $Line[$i] -eq '"') {
+            $sb = New-Object System.Text.StringBuilder
+            $i++
+            while ($i -lt $n) {
+                $q = $Line.IndexOf('"', $i)
+                if ($q -lt 0) { [void]$sb.Append($Line.Substring($i)); $i = $n; break }
+                [void]$sb.Append($Line.Substring($i, $q - $i))
+                if ($q + 1 -lt $n -and $Line[$q + 1] -eq '"') { [void]$sb.Append('"'); $i = $q + 2 } else { $i = $q + 1; break }
+            }
+            $out.Add($sb.ToString())
+            $c = $Line.IndexOf(',', $i)
+            if ($c -lt 0) { break }
+            $i = $c + 1
+        } else {
+            $c = $Line.IndexOf(',', $i)
+            if ($c -lt 0) { $out.Add($Line.Substring($i)); break }
+            $out.Add($Line.Substring($i, $c - $i)); $i = $c + 1
+        }
+    }
+    return , $out.ToArray()
+}
+
+# ADSI entry, using -ForestCredential when given
+function Get-DirEntry {
+    param([string]$Path)
+    if ($ForestCredential) { return New-Object System.DirectoryServices.DirectoryEntry($Path, $ForestCredential.UserName, $ForestCredential.GetNetworkCredential().Password) }
+    New-Object System.DirectoryServices.DirectoryEntry($Path)
+}
+
+# LDAP search returning flat objects (property values joined with '; ')
+function Find-Adsi {
+    param($Root, [string]$Filter, [string[]]$Properties, [string]$Scope = 'Subtree')
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher($Root)
+    $searcher.Filter = $Filter; $searcher.PageSize = 500; $searcher.SearchScope = $Scope
+    $null = $searcher.PropertiesToLoad.AddRange($Properties)
+    $found = $searcher.FindAll()
+    try {
+        foreach ($r in $found) {
+            $o = [ordered]@{}
+            foreach ($p in $Properties) { $o[$p] = (@($r.Properties[$p.ToLower()]) | ForEach-Object { ConvertTo-FlatValue $_ }) -join '; ' }
+            [PSCustomObject]$o
+        }
+    } finally { $found.Dispose() }
+}
+
+# 2002:0a14:1e28::0a14:1e28 (6to4) -> 10.20.30.40, anything else -> ''
+function ConvertFrom-6to4 {
+    param([string]$Ip)
+    if ($Ip -notmatch '^2002:([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):') { return '' }
+    $a = [int]"0x$($Matches[1])"; $b = [int]"0x$($Matches[2])"
+    '{0}.{1}.{2}.{3}' -f ($a -shr 8), ($a -band 255), ($b -shr 8), ($b -band 255)
+}
+
+# "...configured to synchronize to tenant contoso.onmicrosoft.com. This account..." -> contoso.onmicrosoft.com
+function Get-EntraTenantHint {
+    param([string]$Description)
+    if ("$Description" -match '(?i)tenant\s+([a-z0-9-]+\.onmicrosoft\.(com|us|de|cn))') { return $Matches[1].ToLower() }
+    ''
+}
+
+# Probe / ExchangeServer / Client for an SMTP or HTTP source address
+function Get-SourceClass {
+    param([string]$Ip, [string]$Ehlo)
+    if ($Ehlo -match '(?i)^smtp\.availability\.contoso\.com$') { return 'HealthProbe' }
+    if ($Ip -in '127.0.0.1', '::1') { return 'Loopback' }
+    if ($Ip -match '^(?i)fe80:|^169\.254\.') { return 'LinkLocal' }
+    $v4 = ConvertFrom-6to4 $Ip
+    foreach ($x in @($Ip, $v4)) { if ($x -and $script:ExchangeServerIps.ContainsKey($x)) { return "ExchangeServer:$($script:ExchangeServerIps[$x])" } }
+    'Client'
+}
+
 # ---------------------------------------------------------------------------
 # Environment checks
 # ---------------------------------------------------------------------------
@@ -415,6 +527,12 @@ Invoke-Section 'Topology-ExchangeServers' {
     Save-Csv @($rows) 'Topology-ExchangeServers'
 }
 
+# Exchange server addresses, so log sources can be told apart from clients
+$script:ExchangeServerIps = @{}
+foreach ($s in $script:Servers) {
+    try { foreach ($a in [System.Net.Dns]::GetHostAddresses("$($s.Fqdn)")) { $script:ExchangeServerIps[$a.IPAddressToString] = "$($s.Name)" } } catch { }
+}
+
 # Transport/mailbox servers whose logs are read (this server only with -SkipRemoteServers)
 function Get-LogServers {
     $s = @($script:Servers | Where-Object { ($_.IsHubTransportServer -or $_.IsMailboxServer) -and -not $_.IsEdgeServer })
@@ -478,6 +596,8 @@ Invoke-Section 'Topology-ActiveDirectory' {
     $info.MESO_ObjectVersion = Get-AdsiValue ([ADSI]"LDAP://CN=Microsoft Exchange System Objects,$defaultNC") 'objectVersion'
     try {
         $forest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
+        $script:LocalForestName = "$($forest.Name)"
+        $script:TrustedForests = @($forest.GetAllTrustRelationships() | ForEach-Object { "$($_.TargetName)" })
         $info.ForestName = $forest.Name
         $info.ForestDomains = ($forest.Domains | ForEach-Object { $_.Name }) -join '; '
         $info.ForestTrusts = ($forest.GetAllTrustRelationships() | ForEach-Object { "$($_.TargetName) [$($_.TrustType)/$($_.TrustDirection)]" }) -join '; '
@@ -500,6 +620,7 @@ Invoke-Section 'Topology-ActiveDirectory' {
             }
         })
         $found.Dispose()
+        $script:Scps = $scps
         Save-Csv $scps 'Topology-AutodiscoverSCP' | Out-Null
         $info.AutodiscoverSCPCount = $scps.Count
     } catch { $info.AutodiscoverSCPCount = "ERR: $($_.Exception.Message)" }
@@ -521,10 +642,58 @@ Invoke-Section 'Topology-ActiveDirectory' {
         Save-Csv $acc 'Topology-EntraConnectAccounts' | Out-Null
         $info.EntraConnectAccountsFound = $acc.Count
         $info.EntraConnectServerHint = (($acc | ForEach-Object { if ("$($_.Description)" -match 'computer\s+(\S+)') { $Matches[1] } }) -join '; ')
+        $info.EntraConnectTenants = ((@($acc | ForEach-Object { Get-EntraTenantHint $_.Description }) | Where-Object { $_ } | Sort-Object -Unique) -join '; ')
     } catch { $info.EntraConnectAccountsFound = "ERR: $($_.Exception.Message)" }
     Save-Json ([PSCustomObject]$info) 'Topology-ActiveDirectory'
     Save-Csv @([PSCustomObject]$info) 'Topology-ActiveDirectory' | Out-Null
     1
+}
+
+# Every trusted forest (and any named with -TrustedForest): Exchange organizations and servers,
+# Autodiscover SCPs and SCP pointers, and the tenant each Entra Connect account syncs to.
+# Outlook on a PC in an account forest follows SCPs or SCP pointers there, not in this forest.
+$script:ForestPresence = @()
+Invoke-Section 'Topology-ForestExchangePresence' {
+    $forests = @(@($script:LocalForestName) + @($script:TrustedForests) + @($TrustedForest) | Where-Object { $_ } | ForEach-Object { "$_".ToLower() } | Sort-Object -Unique)
+    $summary = @(); $detail = @()
+    foreach ($f in $forests) {
+        $row = [ordered]@{ Forest = $f; IsLocalForest = ($f -eq "$($script:LocalForestName)".ToLower()); Reachable = $false; Error = ''
+            ExchangeSchemaRangeUpper = ''; ExchangeOrganizations = ''; ExchangeServerCount = 0; ExchangeServers = ''
+            AutodiscoverSCPs = 0; SCPPointers = 0; EntraConnectAccounts = ''; EntraConnectTenants = '' }
+        try {
+            $rootDse = Get-DirEntry "LDAP://$f/RootDSE"
+            $cfg = Get-AdsiValue $rootDse 'configurationNamingContext'
+            if (-not $cfg -or $cfg -like 'ERR:*') { throw "RootDSE not readable: $cfg" }
+            $schema = Get-AdsiValue $rootDse 'schemaNamingContext'
+            $rootNc = Get-AdsiValue $rootDse 'rootDomainNamingContext'
+            $row.Reachable = $true
+            $row.ExchangeSchemaRangeUpper = Get-AdsiValue (Get-DirEntry "LDAP://$f/CN=ms-Exch-Schema-Version-Pt,$schema") 'rangeUpper'
+            if ($row.ExchangeSchemaRangeUpper -like 'ERR:*') { $row.ExchangeSchemaRangeUpper = 'Not extended' }
+            $exRoot = Get-DirEntry "LDAP://$f/CN=Microsoft Exchange,CN=Services,$cfg"
+            $orgs = @(); $srv = @()
+            try { $orgs = @(Find-Adsi $exRoot '(objectClass=msExchOrganizationContainer)' @('name') 'OneLevel') } catch { }
+            try { $srv = @(Find-Adsi $exRoot '(&(objectClass=msExchExchangeServer)(!(objectClass=msExchExchangeServerPolicy)))' @('name', 'serialNumber', 'whenChanged')) } catch { }
+            $row.ExchangeOrganizations = (@($orgs | ForEach-Object { $_.name }) -join '; ')
+            $row.ExchangeServerCount = $srv.Count
+            $row.ExchangeServers = (@($srv | ForEach-Object { '{0} ({1})' -f $_.name, $_.serialNumber }) -join '; ')
+            $scpFilter = '(&(objectClass=serviceConnectionPoint)(|(keywords=77378F46-2C66-4aa9-A6A6-3E7A48B19596)(keywords=67661d7F-8FC4-4fa7-BFAC-E1D7794C1F68)))'
+            foreach ($scp in @(Find-Adsi (Get-DirEntry "LDAP://$f/$cfg") $scpFilter @('cn', 'serviceBindingInformation', 'keywords', 'whenChanged', 'distinguishedName'))) {
+                $type = $(if ("$($scp.keywords)" -match '(?i)67661d7F-8FC4-4fa7-BFAC-E1D7794C1F68') { 'SCPPointer' } else { 'AutodiscoverSCP' })
+                if ($type -eq 'SCPPointer') { $row.SCPPointers++ } else { $row.AutodiscoverSCPs++ }
+                $detail += [PSCustomObject]@{ Forest = $f; Type = $type; CN = $scp.cn; ServiceBindingInformation = $scp.serviceBindingInformation; Keywords = $scp.keywords; WhenChanged = $scp.whenChanged; DistinguishedName = $scp.distinguishedName }
+            }
+            $syncFilter = '(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=MSOL_*)(sAMAccountName=AAD_*)(sAMAccountName=Sync_*)))'
+            $acc = @()
+            try { $acc = @(Find-Adsi (Get-DirEntry "GC://$f/$rootNc") $syncFilter @('sAMAccountName', 'description')) }
+            catch { try { $acc = @(Find-Adsi (Get-DirEntry "LDAP://$f/$rootNc") $syncFilter @('sAMAccountName', 'description')) } catch { } }
+            $row.EntraConnectAccounts = (@($acc | ForEach-Object { $h = $(if ("$($_.description)" -match 'computer\s+(\S+)') { $Matches[1] } else { '?' }); "$($_.sAMAccountName) (server $h)" }) -join '; ')
+            $row.EntraConnectTenants = ((@($acc | ForEach-Object { Get-EntraTenantHint $_.description }) | Where-Object { $_ } | Sort-Object -Unique) -join '; ')
+        } catch { $row.Error = $_.Exception.Message }
+        $summary += [PSCustomObject]$row
+    }
+    $script:ForestPresence = $summary
+    Save-Csv $detail 'Topology-ForestSCPs' | Out-Null
+    Save-Csv $summary 'Topology-ForestExchangePresence'
 }
 
 # ===========================================================================
@@ -582,12 +751,23 @@ Invoke-Section 'Hybrid-Migration' {
     $n
 }
 
+# Modern Hybrid Agent ("Microsoft Hybrid Service", MSHybridService) on any Exchange server.
+# It can live on any domain-joined server; a miss here is not proof it is absent.
+$script:HybridAgentRows = @()
 Invoke-Section 'Hybrid-ModernHybridAgent' {
     $rows = @()
-    $rows += Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Hybrid' -or $_.DisplayName -match 'Hybrid' } | ForEach-Object { [PSCustomObject]@{ Type = 'Service'; Name = $_.Name; Display = $_.DisplayName; Status = "$($_.Status)"; Version = '' } }
-    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
-        $rows += Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { "$($_.DisplayName)" -match 'Hybrid' } | ForEach-Object { [PSCustomObject]@{ Type = 'Program'; Name = $_.DisplayName; Display = $_.Publisher; Status = $_.InstallDate; Version = $_.DisplayVersion } }
+    foreach ($s in @($script:Servers | Where-Object { -not $_.IsEdgeServer })) {
+        $svc = @()
+        try {
+            $svc = @($(if ($s.Name -eq $script:LocalServer) { Get-Service -ErrorAction SilentlyContinue } else { Get-Service -ComputerName $s.Name -ErrorAction Stop }) |
+                Where-Object { $_.Name -match 'Hybrid' -or $_.DisplayName -match 'Hybrid' })
+        } catch { $rows += [PSCustomObject]@{ Server = $s.Name; Type = 'Error'; Name = ''; Display = $_.Exception.Message; Status = ''; Version = '' } }
+        $rows += @($svc | ForEach-Object { [PSCustomObject]@{ Server = $s.Name; Type = 'Service'; Name = $_.Name; Display = $_.DisplayName; Status = "$($_.Status)"; Version = '' } })
     }
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+        $rows += Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { "$($_.DisplayName)" -match 'Hybrid' } | ForEach-Object { [PSCustomObject]@{ Server = $script:LocalServer; Type = 'Program'; Name = $_.DisplayName; Display = $_.Publisher; Status = $_.InstallDate; Version = $_.DisplayVersion } }
+    }
+    $script:HybridAgentRows = @($rows | Where-Object { $_.Type -eq 'Service' })
     Save-Csv $rows 'Hybrid-ModernHybridAgent'
 }
 
@@ -753,7 +933,22 @@ Invoke-Section 'Recipients-PublicFolders' {
     }
     Save-Csv @($pf) 'Recipients-PublicFolders' | Out-Null
     Save-Csv @($mailPf | Select-Object DisplayName, PrimarySmtpAddress, EntryId, WhenCreated) 'Recipients-MailPublicFolders' | Out-Null
-    1
+    # Per-folder content and dates: tells "configured" apart from "in use"
+    $stats = @(Get-Safe 'Get-PublicFolderStatistics' @{ ResultSize = 'Unlimited' })
+    Save-Csv @($stats | Select-Object Name, FolderPath, ItemCount, TotalItemSize, CreationTime, LastModificationTime, LastUserAccessTime, LastUserModificationTime, ContentMailboxName) 'Recipients-PublicFolderStatistics' | Out-Null
+    # Permissions other than the defaults (Default/Anonymous at None/Author/Reviewer are the out-of-box set)
+    $perm = @()
+    $folders = @()
+    try { $folders = @(Get-PublicFolder -Recurse -ResultSize 5000 -ErrorAction Stop) } catch { }
+    foreach ($fo in $folders) {
+        foreach ($p in @(Get-Safe 'Get-PublicFolderClientPermission' @{ Identity = "$($fo.Identity)" })) {
+            $user = "$($p.User)"; $rights = (@($p.AccessRights) | ForEach-Object { "$_" }) -join '; '
+            if ($user -in 'Default', 'Anonymous' -and $rights -in 'None', 'Author', 'Reviewer') { continue }
+            $perm += [PSCustomObject]@{ Folder = "$($fo.Identity)"; User = $user; AccessRights = $rights }
+        }
+    }
+    Save-Csv $perm 'Recipients-PublicFolderPermissions' | Out-Null
+    @($stats).Count
 }
 
 Invoke-Section 'Recipients-AddressPolicies' {
@@ -800,8 +995,10 @@ Invoke-Section 'MailFlow-SendConnectors' {
     Save-Csv @($rows) 'MailFlow-SendConnectors'
 }
 
+$script:ReceiveConnectors = @()
 Invoke-Section 'MailFlow-ReceiveConnectors' {
-    $rows = foreach ($c in @(Get-Safe 'Get-ReceiveConnector')) {
+    $script:ReceiveConnectors = @(Get-Safe 'Get-ReceiveConnector')
+    $rows = foreach ($c in $script:ReceiveConnectors) {
         $anon = ''
         try {
             $perm = Get-ADPermission -Identity "$($c.DistinguishedName)" -ErrorAction SilentlyContinue | Where-Object { "$($_.ExtendedRights)" -like '*ms-Exch-SMTP-Accept-Any-Recipient*' -and -not $_.Deny }
@@ -990,6 +1187,7 @@ Invoke-Section 'ClientAccess-Certificates' {
 # ===========================================================================
 # 6. EVIDENCE - MESSAGE TRACKING
 # ===========================================================================
+$script:RelayOutcome = @()
 $trackSkip = $(if ($SkipTrackingLogs) { 'SkipTrackingLogs specified' } else { $null })
 Invoke-Section 'Evidence-MessageTracking' -SkipReason $trackSkip -Script {
     $servers = @(Get-LogServers)
@@ -1009,6 +1207,9 @@ Invoke-Section 'Evidence-MessageTracking' -SkipReason $trackSkip -Script {
     Write-Log ('  Tracking log window: {0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} across {2} server(s)' -f $start, $end, $servers.Count)
 
     $recv = @{}; $send = @{}; $deliver = @{}; $daily = @{}; $fail = @{}
+    # Outcome per message: first SMTP receive from a non-Exchange address is the origin;
+    # DELIVER / SEND (not intra-org) / FAIL events for the same MessageId are its outcome.
+    $origin = @{}; $outcome = @{}
     $chunkDays = 3
     foreach ($s in $servers) {
         $cur = $start
@@ -1023,6 +1224,18 @@ Invoke-Section 'Evidence-MessageTracking' -SkipReason $trackSkip -Script {
                     $dk = "$day|$eid"
                     if (-not $daily.ContainsKey($dk)) { $daily[$dk] = 0 }
                     $daily[$dk]++
+                    $mid = "$($e.MessageId)"
+                    if ($mid -and $eid -in 'DELIVER', 'SEND', 'FAIL') {
+                        if (-not $outcome.ContainsKey($mid)) { $outcome[$mid] = @{ Delivered = 0; Sent = 0; Failed = 0; FailRcpt = @(); Reason = '' } }
+                        $o = $outcome[$mid]
+                        if ($eid -eq 'DELIVER') { $o.Delivered += @($e.Recipients).Count }
+                        elseif ($eid -eq 'SEND' -and "$($e.ConnectorId)" -notmatch '(?i)Intra-Organization') { $o.Sent += @($e.Recipients).Count }
+                        elseif ($eid -eq 'FAIL') {
+                            $o.Failed += @($e.Recipients).Count
+                            if ($o.FailRcpt.Count -lt 5) { $o.FailRcpt += @($e.Recipients | ForEach-Object { "$_".ToLower() }) }
+                            if (-not $o.Reason) { $o.Reason = ((@($e.RecipientStatus) -join ' ') -replace '^\[?\{LED=', '' -replace '\};.*$', '') }
+                        }
+                    }
                     switch ($eid) {
                         'RECEIVE' {
                             if ("$($e.Source)" -ne 'SMTP') { break }
@@ -1037,6 +1250,10 @@ Invoke-Section 'Evidence-MessageTracking' -SkipReason $trackSkip -Script {
                             $r.Days[$day] = 1
                             if ($IncludeSubjects -and -not $r.SampleSubject -and $e.MessageSubject) { $subj = "$($e.MessageSubject)"; $r.SampleSubject = $subj.Substring(0, [math]::Min(60, $subj.Length)) }
                             $r.TotalBytes += [int64]$e.TotalBytes
+                            $src = $(if ($oip -and (Get-SourceClass $oip) -eq 'Client') { $oip } elseif ((Get-SourceClass $ip) -eq 'Client') { $ip } else { '' })
+                            if ($src -and $mid -and (-not $origin.ContainsKey($mid) -or $e.Timestamp -lt $origin[$mid].Time)) {
+                                $origin[$mid] = @{ Ip = $src; Host = "$($e.ClientHostname)"; Connector = "$($e.ConnectorId)"; Sender = "$($e.Sender)".ToLower(); Time = $e.Timestamp }
+                            }
                         }
                         'SEND' {
                             $nhIp = "$($e.ServerIp)"
@@ -1098,6 +1315,39 @@ Invoke-Section 'Evidence-MessageTracking' -SkipReason $trackSkip -Script {
     Save-Csv @($deliver.Values | ForEach-Object { [PSCustomObject]$_ } | Sort-Object Count -Descending) 'Evidence-MessageTracking-LocalDeliveries' | Out-Null
     Save-Csv @($daily.GetEnumerator() | ForEach-Object { $p = $_.Key.Split('|'); [PSCustomObject]@{ Day = $p[0]; EventId = $p[1]; Count = $_.Value } } | Sort-Object Day, EventId) 'Evidence-MessageTracking-DailyHistogram' | Out-Null
     Save-Csv @($fail.GetEnumerator() | ForEach-Object { $p = $_.Key.Split('|', 2); [PSCustomObject]@{ Source = $p[0]; RecipientStatus = $p[1]; Count = $_.Value } } | Sort-Object Count -Descending) 'Evidence-MessageTracking-Failures' | Out-Null
+
+    # Did mail from each original client address actually get anywhere?
+    $bySrc = @{}
+    foreach ($kv in $origin.GetEnumerator()) {
+        $og = $kv.Value
+        $k = "$($og.Ip)"
+        if (-not $bySrc.ContainsKey($k)) { $bySrc[$k] = @{ Ip = $og.Ip; Hosts = @{}; Connectors = @{}; Senders = @{}; Messages = 0; Delivered = 0; Sent = 0; Failed = 0; NoOutcome = 0; MsgFailedOnly = 0; FailRcpt = @{}; Reasons = @{}; First = $og.Time; Last = $og.Time } }
+        $b = $bySrc[$k]; $b.Messages++
+        if ($og.Host -and $b.Hosts.Count -lt 5) { $b.Hosts[$og.Host] = 1 }
+        if ($og.Connector -and $b.Connectors.Count -lt 5) { $b.Connectors[$og.Connector] = 1 }
+        if ($og.Sender -and $b.Senders.Count -lt 10) { $b.Senders[$og.Sender] = 1 }
+        if ($og.Time -lt $b.First) { $b.First = $og.Time }
+        if ($og.Time -gt $b.Last) { $b.Last = $og.Time }
+        $o = $outcome[$kv.Key]
+        if (-not $o) { $b.NoOutcome++; continue }
+        $b.Delivered += $o.Delivered; $b.Sent += $o.Sent; $b.Failed += $o.Failed
+        if ($o.Failed -gt 0 -and ($o.Delivered + $o.Sent) -eq 0) { $b.MsgFailedOnly++ }
+        foreach ($fr in $o.FailRcpt) { if (-not $b.FailRcpt.ContainsKey($fr)) { $b.FailRcpt[$fr] = 0 }; $b.FailRcpt[$fr]++ }
+        if ($o.Reason) { $rk = $(if ($o.Reason.Length -gt 120) { $o.Reason.Substring(0, 120) } else { $o.Reason }); if (-not $b.Reasons.ContainsKey($rk)) { $b.Reasons[$rk] = 0 }; $b.Reasons[$rk]++ }
+    }
+    $outRows = @($bySrc.Values | ForEach-Object {
+        $topFail = @($_.FailRcpt.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '
+        $topReason = "$(@($_.Reasons.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1 | ForEach-Object { $_.Key }))"
+        $verdict = $(if ($_.Messages -eq $_.MsgFailedOnly) { 'All messages failed' } elseif ($_.MsgFailedOnly -gt 0) { 'Some messages failed' } elseif (($_.Delivered + $_.Sent) -gt 0) { 'Delivered' } else { 'No outcome logged' })
+        [PSCustomObject]@{
+            OriginalClientIp = $_.Ip; Hostnames = ($_.Hosts.Keys -join '; '); Connectors = ($_.Connectors.Keys -join '; '); SampleSenders = ($_.Senders.Keys -join '; ')
+            Messages = $_.Messages; RecipientsDelivered = $_.Delivered; RecipientsSentOn = $_.Sent; RecipientsFailed = $_.Failed
+            MessagesFailedEntirely = $_.MsgFailedOnly; MessagesWithoutOutcome = $_.NoOutcome; Verdict = $verdict
+            TopFailedRecipients = $topFail; TopFailReason = $topReason; FirstSeen = $_.First; LastSeen = $_.Last
+        }
+    } | Sort-Object Messages -Descending)
+    $script:RelayOutcome = $outRows
+    Save-Csv $outRows 'Evidence-MessageTracking-OutcomeBySource' | Out-Null
     $recvRows.Count
 }
 
@@ -1107,7 +1357,7 @@ Invoke-Section 'Evidence-MessageTracking' -SkipReason $trackSkip -Script {
 $protoSkip = $(if ($SkipProtocolLogs) { 'SkipProtocolLogs specified' } else { $null })
 Invoke-Section 'Evidence-SmtpReceiveProtocolLogs' -SkipReason $protoSkip -Script {
     $servers = @(Get-LogServers)
-    $agg = @{}; $depthRows = @()
+    $agg = @{}; $depthRows = @(); $conn = @{}
     foreach ($s in $servers) {
         $ts = $null; $fe = $null
         try { $ts = Get-TransportService -Identity $s.Name -ErrorAction Stop } catch { }
@@ -1130,10 +1380,10 @@ Invoke-Section 'Evidence-SmtpReceiveProtocolLogs' -SkipReason $protoSkip -Script
                         # date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context
                         $c = $line.Split(',', 9)
                         if ($c.Count -lt 8) { continue }
-                        $ts2 = $c[0]; $conn = $c[1]; $sid = $c[2]; $remote = Get-EndpointIp $c[5]; $ev = $c[6]; $data = $c[7].Trim('"')
+                        $ts2 = $c[0]; $cid = $c[1]; $sid = $c[2]; $remote = Get-EndpointIp $c[5]; $ev = $c[6]; $data = $c[7].Trim('"')
                         $ctx = $(if ($c.Count -ge 9) { $c[8].Trim('"') } else { '' })
-                        $sk = "$conn|$sid"
-                        if (-not $sessions.ContainsKey($sk)) { $sessions[$sk] = @{ Ip = $remote; Conn = $conn; Ehlo = ''; Auth = ''; AuthUser = ''; Tls = $false; Time = $ts2; Mail = 0 } }
+                        $sk = "$cid|$sid"
+                        if (-not $sessions.ContainsKey($sk)) { $sessions[$sk] = @{ Ip = $remote; Conn = $cid; Ehlo = ''; Auth = ''; AuthUser = ''; Tls = $false; Time = $ts2; Mail = 0; Rcpt = 0; Queued = 0; Rejected = 0 } }
                         $ss = $sessions[$sk]
                         if ($ev -eq '<') {
                             $u = $data.ToUpper()
@@ -1141,6 +1391,12 @@ Invoke-Section 'Evidence-SmtpReceiveProtocolLogs' -SkipReason $protoSkip -Script
                             elseif ($u.StartsWith('AUTH')) { $parts = $data.Split(' '); if ($parts.Count -gt 1) { $ss.Auth = $parts[1] } }
                             elseif ($u.StartsWith('STARTTLS') -or $u.StartsWith('X-ANONYMOUSTLS')) { $ss.Tls = $true }
                             elseif ($u.StartsWith('MAIL FROM')) { $ss.Mail++ }
+                            elseif ($u.StartsWith('RCPT TO')) { $ss.Rcpt++ }
+                        }
+                        elseif ($ev -eq '>') {
+                            # 250 2.6.0 = message queued; 5xx = rejected (relay denied, unknown recipient, ...)
+                            if ($data.StartsWith('250 2.6.0')) { $ss.Queued++ }
+                            elseif ($data -match '^5\d\d[ -]') { $ss.Rejected++ }
                         }
                         elseif ($ev -eq '*') {
                             # Successful authentication is logged as: *,DOMAIN\user,authenticated
@@ -1152,8 +1408,22 @@ Invoke-Section 'Evidence-SmtpReceiveProtocolLogs' -SkipReason $protoSkip -Script
                 } catch { Write-Log "  Protocol log $($f.Name) failed: $($_.Exception.Message)" 'WARN' } finally { if ($sr) { $sr.Close() } }
                 foreach ($ss in $sessions.Values) {
                     $k = "$($s.Name)|$role|$($ss.Ip)|$($ss.Conn)"
-                    if (-not $agg.ContainsKey($k)) { $agg[$k] = @{ Server = $s.Name; Role = $role; ClientIp = $ss.Ip; ConnectorId = $ss.Conn; Sessions = 0; MailCmds = 0; Ehlo = @{}; AuthMech = @{}; AuthUsers = @{}; TlsSessions = 0; First = $ss.Time; Last = $ss.Time } }
-                    $a = $agg[$k]; $a.Sessions++; $a.MailCmds += $ss.Mail
+                    if (-not $agg.ContainsKey($k)) { $agg[$k] = @{ Server = $s.Name; Role = $role; ClientIp = $ss.Ip; ConnectorId = $ss.Conn; Sessions = 0; MailCmds = 0; Rcpts = 0; Queued = 0; Rejected = 0; Probe = 0; Ehlo = @{}; AuthMech = @{}; AuthUsers = @{}; TlsSessions = 0; First = $ss.Time; Last = $ss.Time } }
+                    $a = $agg[$k]; $a.Sessions++; $a.MailCmds += $ss.Mail; $a.Rcpts += $ss.Rcpt; $a.Queued += $ss.Queued; $a.Rejected += $ss.Rejected
+                    $cls = Get-SourceClass $ss.Ip $ss.Ehlo
+                    if ($cls -in 'HealthProbe', 'Loopback') { $a.Probe++ }
+                    # Per connector, health probes and loopback excluded
+                    if (-not $conn.ContainsKey($ss.Conn)) { $conn[$ss.Conn] = @{ Sessions = 0; Client = 0; ExchangeServer = 0; WithMail = 0; Queued = 0; Rejected = 0; Sources = @{}; First = ''; Last = '' } }
+                    $cu = $conn[$ss.Conn]; $cu.Sessions++
+                    if ($cls -notin 'HealthProbe', 'Loopback') {
+                        if ($cls -like 'ExchangeServer:*' -or $cls -eq 'LinkLocal') { $cu.ExchangeServer++ } else { $cu.Client++ }
+                        if ($ss.Mail -gt 0) { $cu.WithMail++ }
+                        $cu.Queued += $ss.Queued; $cu.Rejected += $ss.Rejected
+                        $sk2 = $(if ($ss.Ehlo) { "$($ss.Ip) ($($ss.Ehlo))" } else { "$($ss.Ip)" })
+                        if ($cu.Sources.ContainsKey($sk2)) { $cu.Sources[$sk2]++ } elseif ($cu.Sources.Count -lt 50) { $cu.Sources[$sk2] = 1 }
+                        if (-not $cu.First -or $ss.Time -lt $cu.First) { $cu.First = $ss.Time }
+                        if (-not $cu.Last -or $ss.Time -gt $cu.Last) { $cu.Last = $ss.Time }
+                    }
                     if ($ss.Ehlo -and $a.Ehlo.Count -lt 5) { $a.Ehlo[$ss.Ehlo] = 1 }
                     if ($ss.Auth) { $a.AuthMech[$ss.Auth] = 1 }
                     if ($ss.AuthUser -and $a.AuthUsers.Count -lt 5) { $a.AuthUsers[$ss.AuthUser] = 1 }
@@ -1168,13 +1438,47 @@ Invoke-Section 'Evidence-SmtpReceiveProtocolLogs' -SkipReason $protoSkip -Script
     $rows = @($agg.Values | ForEach-Object {
         [PSCustomObject]@{
             Server = $_.Server; Role = $_.Role; ClientIp = $_.ClientIp; IsMicrosoftIP = (Test-MicrosoftIP $_.ClientIp); ConnectorId = $_.ConnectorId
-            Sessions = $_.Sessions; MailFromCommands = $_.MailCmds; TlsSessions = $_.TlsSessions; TlsPct = $(if ($_.Sessions) { [math]::Round(100 * $_.TlsSessions / $_.Sessions, 0) } else { '' })
+            SourceClass = (Get-SourceClass $_.ClientIp ($_.Ehlo.Keys | Select-Object -First 1))
+            Sessions = $_.Sessions; MailFromCommands = $_.MailCmds; RcptToCommands = $_.Rcpts; QueuedMessages = $_.Queued; Rejected5xx = $_.Rejected
+            TlsSessions = $_.TlsSessions; TlsPct = $(if ($_.Sessions) { [math]::Round(100 * $_.TlsSessions / $_.Sessions, 0) } else { '' })
             EhloNames = ($_.Ehlo.Keys -join '; '); AuthMechanisms = ($_.AuthMech.Keys -join '; '); AuthUsers = ($_.AuthUsers.Keys -join '; ')
             FirstSeen = $_.First; LastSeen = $_.Last
         }
     } | Sort-Object MailFromCommands -Descending)
     Save-Csv $rows 'Evidence-SmtpReceiveProtocolLogs-BySource' | Out-Null
+    $script:ProtoConnUsage = $conn
+    $script:ProtoLogDays = @($depthRows | Where-Object { $_.DaysAvailable -ne '' } | ForEach-Object { [double]$_.DaysAvailable } | Sort-Object | Select-Object -First 1)
     $rows.Count
+}
+
+# Every receive connector, including those nobody used: the list that decides which relay
+# dependencies are real. Health probes (smtp.availability.contoso.com) and loopback are excluded.
+$script:RecvUsage = @()
+Invoke-Section 'Evidence-ReceiveConnectorUsage' -SkipReason $protoSkip -Script {
+    $window = $(if (@($script:ProtoLogDays).Count) { [math]::Round(@($script:ProtoLogDays)[0], 1) } else { '' })
+    $rows = foreach ($c in $script:ReceiveConnectors) {
+        $id = "$($c.Identity)"
+        $u = $(if ($script:ProtoConnUsage -and $script:ProtoConnUsage.ContainsKey($id)) { $script:ProtoConnUsage[$id] } else { $null })
+        $isDefault = ("$($c.Name)" -match '^(Default |Client |Outbound Proxy )')
+        $client = $(if ($u) { $u.Client } else { 0 }); $withMail = $(if ($u) { $u.WithMail } else { 0 }); $queued = $(if ($u) { $u.Queued } else { 0 })
+        $verdict = $(if ("$($c.ProtocolLoggingLevel)" -ne 'Verbose') { 'Unknown: protocol logging is off' }
+            elseif (-not $c.Enabled) { 'Disabled' }
+            elseif (-not $u -or ($client + $u.ExchangeServer) -eq 0) { 'No sessions in window' }
+            elseif ($withMail -eq 0) { 'Sessions but no mail' }
+            elseif ($queued -eq 0) { 'Mail attempted, none accepted' }
+            else { 'In use' })
+        $top = $(if ($u) { @($u.Sources.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ' } else { '' })
+        [PSCustomObject]@{
+            Server = "$($c.Server)"; Name = "$($c.Name)"; Identity = $id; Enabled = $c.Enabled; IsDefault = $isDefault
+            Bindings = ((@($c.Bindings) | ForEach-Object { "$_" }) -join '; '); RemoteIPRangeCount = @($c.RemoteIPRanges).Count
+            ProtocolLoggingLevel = "$($c.ProtocolLoggingLevel)"; LogWindowDays = $window
+            ClientSessions = $client; ExchangeServerSessions = $(if ($u) { $u.ExchangeServer } else { 0 })
+            SessionsWithMail = $withMail; QueuedMessages = $queued; Rejected5xx = $(if ($u) { $u.Rejected } else { 0 })
+            TopSources = $top; FirstSeen = $(if ($u) { $u.First } else { '' }); LastSeen = $(if ($u) { $u.Last } else { '' }); Verdict = $verdict
+        }
+    }
+    $script:RecvUsage = @($rows)
+    Save-Csv @($rows | Sort-Object IsDefault, Verdict, Identity) 'Evidence-ReceiveConnectorUsage'
 }
 
 # ===========================================================================
@@ -1260,14 +1564,89 @@ Invoke-Section 'Evidence-AdminAuditLog' {
     $rows.Count
 }
 
-Invoke-Section 'Evidence-HttpProxyLogs' {
+# HttpProxy logs name the mailbox behind each request (AnchorMailbox, and mailboxId= for MAPI).
+# That separates "user opens own cloud mailbox via redirect" from "user opens an on-prem
+# mailbox" - for example the public-folder mailbox when Exchange Online has
+# PublicFoldersEnabled = Remote, or a delegate/shared mailbox still on-prem.
+$script:ProxyByTarget = @()
+$hpSkip = $(if ($SkipHttpProxyLogs) { 'SkipHttpProxyLogs specified' } else { $null })
+Invoke-Section 'Evidence-HttpProxyLogs' -SkipReason $hpSkip -Script {
     if (-not $script:ExchInstall) { throw 'Exchange install path unknown' }
-    $root = Join-Path $script:ExchInstall 'Logging\HttpProxy'
-    $rows = foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-        $st = Get-DirStats -Path $d.FullName -Filter '*.LOG'
-        [PSCustomObject]@{ Protocol = $d.Name; Files = $st.Files; SizeMB = $st.SizeMB; Oldest = $st.Oldest; Newest = $st.Newest }
+    $localRoot = Join-Path $script:ExchInstall 'Logging\HttpProxy'
+    $cut = (Get-Date).AddDays(-$IisDays)
+    $parsed = 'Autodiscover', 'Mapi', 'Ews', 'RpcHttp', 'Eas'
+    $byGuid = @{}; $bySmtp = @{}
+    foreach ($m in $script:OnPremMailboxes) {
+        $ref = @{ Smtp = "$($m.PrimarySmtpAddress)".ToLower(); Type = "$($m.RecipientTypeDetails)" }
+        if ($m.ExchangeGuid) { $byGuid["$($m.ExchangeGuid)".ToLower()] = $ref }
+        foreach ($a in @($m.EmailAddresses)) { if ("$a" -match '^(?i)smtp:(.+)$') { $bySmtp[$Matches[1].ToLower()] = $ref } }
     }
-    Save-Csv @($rows) 'Evidence-HttpProxyLogs-Depth'
+    $servers = @($script:Servers | Where-Object { ($_.IsClientAccessServer -or $_.IsMailboxServer) -and -not $_.IsEdgeServer })
+    if ($SkipRemoteServers) { $servers = @($servers | Where-Object { $_.Name -eq $script:LocalServer }) }
+    $depth = @(); $agg = @{}
+    foreach ($s in $servers) {
+        $root = $(if ($s.Name -eq $script:LocalServer) { $localRoot } else { ConvertTo-UncPath $s.Name $localRoot })
+        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+            $st = Get-DirStats -Path $d.FullName -Filter '*.LOG'
+            $depth += [PSCustomObject]@{ Server = $s.Name; Protocol = $d.Name; Files = $st.Files; SizeMB = $st.SizeMB; Oldest = $st.Oldest; Newest = $st.Newest; DaysAvailable = (Get-DaysAvailable $st.Oldest) }
+            if ($parsed -notcontains $d.Name) { continue }
+            foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter '*.LOG' -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cut })) {
+                $sr = $null; $iU = -1
+                try {
+                    $sr = Open-LogReader $f.FullName
+                    while ($null -ne ($line = $sr.ReadLine())) {
+                        if ($line.StartsWith('#Fields:')) {
+                            $fl = @($line.Substring(8).Trim().Split(',') | ForEach-Object { $_.Trim() })
+                            $iU = [array]::IndexOf($fl, 'AuthenticatedUser'); $iA = [array]::IndexOf($fl, 'UserAgent'); $iM = [array]::IndexOf($fl, 'AnchorMailbox')
+                            $iQ = [array]::IndexOf($fl, 'UrlQuery'); $iS = [array]::IndexOf($fl, 'HttpStatus'); $iC = [array]::IndexOf($fl, 'ClientIpAddress'); $iT = [array]::IndexOf($fl, 'DateTime')
+                            continue
+                        }
+                        if ($line.Length -eq 0 -or $line[0] -eq '#' -or $iU -lt 0) { continue }
+                        $c = Split-CsvLine $line
+                        $n = $c.Count
+                        $user = $(if ($iU -lt $n) { $c[$iU] } else { '' }); $ua = $(if ($iA -ge 0 -and $iA -lt $n) { $c[$iA] } else { '' })
+                        if ($user -match 'HealthMailbox' -or $ua -match '^(AMProbe|MSEXCHMON|ACTIVEMONITORING|MSExchangeMonitoring)') { continue }
+                        $anchor = $(if ($iM -ge 0 -and $iM -lt $n) { $c[$iM] } else { '' }); $query = $(if ($iQ -ge 0 -and $iQ -lt $n) { $c[$iQ] } else { '' })
+                        $status = $(if ($iS -ge 0 -and $iS -lt $n) { $c[$iS] } else { '' }); $when = $(if ($iT -ge 0 -and $iT -lt $n) { $c[$iT] } else { '' })
+                        $ip = $(if ($iC -ge 0 -and $iC -lt $n) { Get-EndpointIp $c[$iC] } else { '' })
+                        # Target mailbox: MAPI mailboxId=<guid>@domain, else AnchorMailbox (Smtp~a@b, MailboxGuid~g@b, ...)
+                        $guid = ''; $smtp = ''
+                        if ($query -match '(?i)mailboxId=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') { $guid = $Matches[1].ToLower() }
+                        elseif ($anchor -match '(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') { $guid = $Matches[1].ToLower() }
+                        if ($anchor -match '(?i)^smtp~(.+)$') { $smtp = $Matches[1].ToLower() }
+                        $ref = $(if ($guid -and $byGuid.ContainsKey($guid)) { $byGuid[$guid] } elseif ($smtp -and $bySmtp.ContainsKey($smtp)) { $bySmtp[$smtp] } else { $null })
+                        $target = $(if ($ref) { $ref.Smtp } elseif ($smtp) { $smtp } elseif ($guid) { $guid } else { $anchor })
+                        $ttype = $(if ($ref) { $ref.Type } elseif ($target) { 'NotOnPrem' } else { '' })
+                        $k = "$($s.Name)|$($d.Name)|$user|$target"
+                        if (-not $agg.ContainsKey($k)) { $agg[$k] = @{ Server = $s.Name; Protocol = $d.Name; User = $user; Target = $target; TargetType = $ttype; Hits = 0; Ok = 0; Ips = @{}; First = $when; Last = $when } }
+                        $a = $agg[$k]; $a.Hits++
+                        if ($status -like '2*') { $a.Ok++ }
+                        if ($ip -and $a.Ips.Count -lt 5) { $a.Ips[$ip] = 1 }
+                        if ($when -and $when -lt $a.First) { $a.First = $when }
+                        if ($when -gt $a.Last) { $a.Last = $when }
+                    }
+                } catch { Write-Log "  HttpProxy log $($f.FullName) failed: $($_.Exception.Message)" 'WARN' } finally { if ($sr) { $sr.Close() } }
+            }
+        }
+    }
+    Save-Csv @($depth) 'Evidence-HttpProxyLogs-Depth' | Out-Null
+    $rows = @($agg.Values | ForEach-Object {
+        [PSCustomObject]@{ Server = $_.Server; Protocol = $_.Protocol; User = $_.User; Target = $_.Target; TargetType = $_.TargetType; Hits = $_.Hits; Http2xx = $_.Ok; ClientIps = ($_.Ips.Keys -join '; '); FirstSeen = $_.First; LastSeen = $_.Last }
+    } | Sort-Object Hits -Descending)
+    Save-Csv $rows 'Evidence-HttpProxy-ByUserTarget' | Out-Null
+    $byTarget = @($rows | Group-Object Protocol, Target | ForEach-Object {
+        $g = $_.Group
+        [PSCustomObject]@{
+            Protocol = $g[0].Protocol; Target = $g[0].Target; TargetType = $g[0].TargetType
+            DistinctUsers = @($g | Where-Object { $_.User } | Select-Object -ExpandProperty User -Unique).Count
+            Hits = ($g | Measure-Object Hits -Sum).Sum; Http2xx = ($g | Measure-Object Http2xx -Sum).Sum
+            Servers = (@($g | Select-Object -ExpandProperty Server -Unique) -join '; ')
+            FirstSeen = ($g | Sort-Object FirstSeen | Select-Object -First 1).FirstSeen; LastSeen = ($g | Sort-Object LastSeen -Descending | Select-Object -First 1).LastSeen
+        }
+    } | Sort-Object Hits -Descending)
+    $script:ProxyByTarget = $byTarget
+    Save-Csv $byTarget 'Evidence-HttpProxy-ByTarget' | Out-Null
+    $rows.Count
 }
 
 # ===========================================================================
@@ -1450,6 +1829,7 @@ Invoke-Section 'DNS-Records' {
     try { $extra += ("$((Get-Safe 'Get-HybridConfiguration').TlsCertificateName)" -replace '.*CN=([^,]+).*', '$1') } catch { }
     $extra = @($extra | Where-Object { $_ -and $_ -match '\.' -and $_ -notmatch '^\d+\.\d+\.\d+\.\d+$' -and $_ -notmatch '^\[' -and $_ -notmatch '[<>]' } | ForEach-Object { "$_".ToLower() } | Sort-Object -Unique)
     foreach ($h in $extra) { foreach ($v in $views) { $rows += Resolve-Rec $v[0] $v[1] $h 'A' } }
+    $script:NamespaceHosts = $extra; $script:PublicResolver = $pub
     if ($pub) {
         $ips = @()
         $ips += @($rows | Where-Object { $_.Type -eq 'TXT' -and $_.Value -match 'v=spf1' } | ForEach-Object { [regex]::Matches($_.Value, 'ip4:(\d+\.\d+\.\d+\.\d+)') | ForEach-Object { $_.Groups[1].Value } })
@@ -1481,8 +1861,113 @@ Invoke-Section 'DNS-Records' {
     @($rows).Count
 }
 
+# Every Exchange host name (vdir URLs, SCPs, connector FQDNs, HCW certificate name, autodiscover.<domain>)
+# with what it resolves to. A name on the DAG cluster IP disappears when the DAG is removed; a
+# public record for a name no internet client uses is exposure that can be removed early.
+$script:NamespaceRows = @()
+Invoke-Section 'Topology-NamespaceCheck' {
+    $sources = @{}
+    $addSrc = { param($h, $src) $h = "$h".ToLower().TrimEnd('.'); if (-not $h -or $h -notmatch '\.' -or $h -match '^\d+\.\d+\.\d+\.\d+$') { return }; if (-not $sources.ContainsKey($h)) { $sources[$h] = @{} }; $sources[$h][$src] = 1 }
+    foreach ($h in @($script:NamespaceHosts)) { & $addSrc $h 'Vdir/Connector/Hybrid' }
+    foreach ($scp in @($script:Scps)) { foreach ($u in @("$($scp.ServiceBindingInformation)" -split '; ')) { try { & $addSrc ([uri]$u).Host 'SCP' } catch { } } }
+    foreach ($d in $script:AcceptedDomainNames) { if ($d -notmatch 'onmicrosoft\.com$') { & $addSrc "autodiscover.$d" 'Autodiscover'; & $addSrc "mail.$d" 'mail.<domain>' } }
+    foreach ($s in $script:Servers) { & $addSrc "$($s.Fqdn)" 'ExchangeServer' }
+    $dagIps = @{}
+    foreach ($dag in @(Get-Safe 'Get-DatabaseAvailabilityGroup')) {
+        foreach ($ip in @($dag.DatabaseAvailabilityGroupIpv4Addresses) + @($dag.DatabaseAvailabilityGroupIpAddresses)) { if ("$ip" -match '^\d+\.\d+\.\d+\.\d+$') { $dagIps["$ip"] = "$($dag.Name)" } }
+    }
+    # Public wildcard per parent zone: a random label that resolves means *.zone exists
+    $wild = @{}
+    $pub = $script:PublicResolver
+    $rows = foreach ($h in @($sources.Keys | Sort-Object)) {
+        $int = @(Resolve-Rec 'Internal' $null $h 'A' | Where-Object { $_.Value } | ForEach-Object { "$($_.Value)" })
+        $pubA = @(); $isWild = $false
+        if ($pub) {
+            $pubA = @(Resolve-Rec 'Public' $pub $h 'A' | Where-Object { $_.Value } | ForEach-Object { "$($_.Value)" })
+            $zone = ($h -split '\.', 2)[1]
+            if ($zone -and -not $wild.ContainsKey($zone)) { $wild[$zone] = @(Resolve-Rec 'Public' $pub ('decomcheck-{0}.{1}' -f (Get-Random -Minimum 100000 -Maximum 999999), $zone) 'A' | Where-Object { $_.Value } | ForEach-Object { "$($_.Value)" }) }
+            if ($pubA.Count -and $wild[$zone].Count -and -not @($pubA | Where-Object { $wild[$zone] -notcontains $_ }).Count) { $isWild = $true }
+        }
+        $targets = @(foreach ($ip in $int) {
+            if ($dagIps.ContainsKey($ip)) { "DAG cluster IP ($($dagIps[$ip]))" }
+            elseif ($script:ExchangeServerIps.ContainsKey($ip)) { "Exchange server $($script:ExchangeServerIps[$ip])" }
+            else { "Other ($ip)" }
+        })
+        [PSCustomObject]@{
+            Name = $h; Sources = ($sources[$h].Keys -join '; ')
+            InternalIPs = ($int -join '; '); InternalTarget = (($targets | Sort-Object -Unique) -join '; ')
+            OnDagClusterIP = [bool]@($int | Where-Object { $dagIps.ContainsKey($_) }).Count
+            PublicIPs = ($pubA -join '; '); PublicIsWildcard = $isWild
+            PubliclyResolvable = ($pubA.Count -gt 0 -and -not $isWild)
+        }
+    }
+    $script:NamespaceRows = @($rows)
+    Save-Csv @($rows) 'Topology-NamespaceCheck'
+}
+
 # ===========================================================================
-# 11. PREREQUISITE SUMMARY
+# 11. FINDINGS - what the evidence above says, as rules a reviewer can check
+# ===========================================================================
+Invoke-Section 'Findings' {
+    $f = @()
+    $add = { param($sev, $area, $finding, $evidence, $file) [PSCustomObject]@{ Severity = $sev; Area = $area; Finding = $finding; Evidence = $evidence; File = $file } }
+
+    # Receive connectors nobody used
+    $custom = @($script:RecvUsage | Where-Object { -not $_.IsDefault })
+    $unused = @($custom | Where-Object { $_.Verdict -in 'No sessions in window', 'Sessions but no mail' })
+    if ($custom.Count) {
+        $f += & $add 'Info' 'Relay' ('{0} of {1} custom receive connectors received no mail in the {2}-day protocol-log window' -f $unused.Count, $custom.Count, $custom[0].LogWindowDays) (($unused | ForEach-Object { $_.Identity }) -join '; ') 'Evidence-ReceiveConnectorUsage.csv'
+    }
+    foreach ($c in @($custom | Where-Object { $_.Verdict -eq 'Mail attempted, none accepted' })) {
+        $f += & $add 'Medium' 'Relay' "Connector $($c.Identity): clients tried to send mail but none was accepted" $c.TopSources 'Evidence-ReceiveConnectorUsage.csv'
+    }
+    foreach ($c in @($custom | Where-Object { $_.Verdict -like 'Unknown*' })) {
+        $f += & $add 'Medium' 'Relay' "Connector $($c.Identity): protocol logging is off, so its use cannot be measured" "ProtocolLoggingLevel=$($c.ProtocolLoggingLevel)" 'Evidence-ReceiveConnectorUsage.csv'
+    }
+    # Relay sources whose mail went nowhere
+    foreach ($r in @($script:RelayOutcome | Where-Object { $_.Verdict -eq 'All messages failed' })) {
+        $f += & $add 'High' 'Relay' "All $($r.Messages) message(s) from $($r.OriginalClientIp) failed; mail from this source is not being delivered today" "Senders: $($r.SampleSenders). Reason: $($r.TopFailReason). Recipients: $($r.TopFailedRecipients)" 'Evidence-MessageTracking-OutcomeBySource.csv'
+    }
+    # Namespaces on the DAG cluster IP / publicly resolvable
+    foreach ($n in @($script:NamespaceRows | Where-Object { $_.OnDagClusterIP })) {
+        $f += & $add 'High' 'Namespace' "$($n.Name) resolves internally to the DAG cluster IP; removing the DAG removes this name" "$($n.InternalIPs) ($($n.InternalTarget)); used by: $($n.Sources)" 'Topology-NamespaceCheck.csv'
+    }
+    $pubNames = @($script:NamespaceRows | Where-Object { $_.PubliclyResolvable -and $_.Sources -match 'Vdir|SCP|ExchangeServer' })
+    if ($pubNames.Count) {
+        $f += & $add 'Medium' 'Exposure' "$($pubNames.Count) Exchange host name(s) resolve publicly; compare with internet clients in the IIS evidence before keeping them published" (($pubNames | ForEach-Object { "$($_.Name)=$($_.PublicIPs)" }) -join '; ') 'Topology-NamespaceCheck.csv'
+    }
+    # Other forests: Exchange organizations, SCPs, SCP pointers
+    foreach ($p in @($script:ForestPresence | Where-Object { -not $_.IsLocalForest })) {
+        if (-not $p.Reachable) { $f += & $add 'Medium' 'Forests' "Forest $($p.Forest) could not be read; SCPs and Exchange objects there are unknown (use -ForestCredential)" $p.Error 'Topology-ForestExchangePresence.csv'; continue }
+        if ([int]$p.ExchangeServerCount -gt 0 -or $p.ExchangeOrganizations) { $f += & $add 'High' 'Forests' "Forest $($p.Forest) contains its own Exchange organization ($($p.ExchangeOrganizations)) with $($p.ExchangeServerCount) server object(s)" $p.ExchangeServers 'Topology-ForestExchangePresence.csv' }
+        if ([int]$p.AutodiscoverSCPs -gt 0 -or [int]$p.SCPPointers -gt 0) { $f += & $add 'High' 'Autodiscover' "Forest $($p.Forest) has $($p.AutodiscoverSCPs) Autodiscover SCP(s) and $($p.SCPPointers) SCP pointer(s); domain-joined Outlook there follows them" 'See Topology-ForestSCPs.csv' 'Topology-ForestSCPs.csv' }
+    }
+    # Tenants
+    $tenants = @($script:ForestPresence | ForEach-Object { "$($_.EntraConnectTenants)" -split '; ' } | Where-Object { $_ } | Sort-Object -Unique)
+    $iocTenants = @(Get-Safe 'Get-IntraOrganizationConnector' | ForEach-Object { @($_.TargetAddressDomains) } | ForEach-Object { "$_".ToLower() } | Where-Object { $_ -match '\.mail\.onmicrosoft\.com$' } | ForEach-Object { $_ -replace '\.mail\.onmicrosoft\.com$', '.onmicrosoft.com' } | Sort-Object -Unique)
+    $allTenants = @(@($tenants) + @($iocTenants) | Sort-Object -Unique)
+    if ($allTenants.Count -gt 1) {
+        $f += & $add 'High' 'Tenants' "This environment is tied to $($allTenants.Count) Microsoft 365 tenants; hybrid teardown has to cover each one" "Entra Connect accounts: $($tenants -join ', '). Hybrid IOC targets: $($iocTenants -join ', ')" 'Topology-ForestExchangePresence.csv; Hybrid-IntraOrganizationConnector.csv'
+    }
+    # Hybrid Agent
+    foreach ($h in @($script:HybridAgentRows)) { $f += & $add 'Info' 'Hybrid' "Hybrid Agent service found on $($h.Server) ($($h.Status)); uninstall it and remove its Entra application proxy connector at teardown" "$($h.Name) / $($h.Display)" 'Hybrid-ModernHybridAgent.csv' }
+    # System mailboxes on dismounted databases
+    $down = @($script:Databases | Where-Object { "$($_.Mounted)" -eq 'False' } | ForEach-Object { "$($_.Name)" })
+    foreach ($db in $down) {
+        $sys = @($script:OnPremMailboxes | Where-Object { "$($_.Database)" -eq $db -and "$($_.RecipientTypeDetails)" -match 'Arbitration|AuditLog|PublicFolder|Discovery' })
+        if ($sys.Count) { $f += & $add 'High' 'Databases' "Database $db is dismounted and holds $($sys.Count) system mailbox(es); it must be mounted (or the mailboxes rehomed) before decommission" (($sys | ForEach-Object { "$($_.RecipientTypeDetails): $($_.Name)" }) -join '; ') 'Recipients-Mailboxes.csv; Topology-MailboxDatabases.csv' }
+    }
+    # On-prem mailboxes opened by many users (remote public folders, shared or delegate access)
+    foreach ($t in @($script:ProxyByTarget | Where-Object { $_.Protocol -in 'Mapi', 'RpcHttp', 'Ews' -and $_.TargetType -and $_.TargetType -ne 'NotOnPrem' -and $_.DistinctUsers -ge 2 })) {
+        $why = $(if ($t.TargetType -eq 'PublicFolderMailbox') { 'public-folder mailbox; with Exchange Online PublicFoldersEnabled=Remote every Outlook profile opens it' } else { 'on-prem mailbox opened by several accounts (shared or delegate access)' })
+        $f += & $add 'High' 'Client access' "$($t.DistinctUsers) users opened $($t.Target) over $($t.Protocol) ($why)" "$($t.Hits) requests, $($t.FirstSeen) to $($t.LastSeen), servers $($t.Servers)" 'Evidence-HttpProxy-ByTarget.csv'
+    }
+    $sev = @{ High = 0; Medium = 1; Info = 2 }
+    Save-Csv @($f | Sort-Object { $sev[$_.Severity] }, Area) 'Findings'
+}
+
+# ===========================================================================
+# 12. PREREQUISITE SUMMARY
 # ===========================================================================
 Invoke-Section 'Prerequisites-Summary' {
     $rows = @()
