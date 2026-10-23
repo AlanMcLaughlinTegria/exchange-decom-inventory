@@ -1,5 +1,5 @@
-Exchange decommission inventory scripts - version 1.1
-======================================================
+Exchange decommission inventory scripts
+=======================================
 
 All three scripts are read-only. Each one writes a timestamped folder and a ZIP of
 that folder next to the script (or C:\DecomInventory, then %TEMP%, if the script
@@ -61,6 +61,10 @@ Run:      .\Get-EXODecomInventory.ps1 -UserPrincipalName admin@customer.com
 
 Expect up to three sign-in prompts: Exchange Online, Microsoft Graph, and
 Security & Compliance.
+
+The message trace covers the last 90 days and can take hours in a busy tenant.
+To shorten it:
+          .\Get-EXODecomInventory.ps1 -UserPrincipalName admin@customer.com -MessageTraceDays 30
 
 
 What to return

@@ -30,7 +30,12 @@
 .PARAMETER SkipGraph
     Skip Microsoft Graph sections (licensing, directory sync status).
 .PARAMETER SkipMessageTrace
-    Skip the 10-day message trace.
+    Skip the message trace.
+.PARAMETER MessageTraceDays
+    Days of message trace to collect, 1-90. Default 90. More than 10 days needs
+    Get-MessageTraceV2 (current ExchangeOnlineManagement); with the older
+    Get-MessageTrace the window is capped at 10 days. A busy tenant can take
+    hours at 90 days; use 30 or less to shorten the run.
 .PARAMETER SkipAuditLog
     Skip the unified audit log search.
 .PARAMETER SkipCompliance
@@ -46,6 +51,9 @@
     .\Get-EXODecomInventory.ps1 -UserPrincipalName admin@contoso.com
 
 .NOTES
+    Version 1.2
+      - Message trace covers up to 90 days (default) through Get-MessageTraceV2, saved locally,
+        with automatic waits when Microsoft throttles the queries. -MessageTraceDays sets the window.
     Version 1.1
       Fixed
       - The Exchange Online sign-in was commented out, so every section failed unless a session was
@@ -72,6 +80,7 @@ param(
     [string]$UserPrincipalName,
     [switch]$SkipGraph,
     [switch]$SkipMessageTrace,
+    [ValidateRange(1, 90)][int]$MessageTraceDays = 90,
     [switch]$SkipAuditLog,
     [switch]$SkipCompliance,
     [int]$AuditDays = 90,
@@ -83,7 +92,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 $WarningPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
-$script:ScriptVersion = '1.1'
+$script:ScriptVersion = '1.2'
 $script:StartTime = Get-Date
 
 # ---------------------------------------------------------------------------
@@ -199,6 +208,20 @@ function Get-Safe {
     try { & $Command @Params -ErrorAction SilentlyContinue -ErrorVariable ev }
     catch { Write-Log "  $Command failed: $($_.Exception.Message)" 'WARN'; return }
     if ($ev) { Write-Log ('  {0}: {1} error(s), first: {2}' -f $Command, @($ev).Count, "$(@($ev)[0])") 'WARN' }
+}
+
+# Runs one message trace query; when Microsoft throttles it, waits and retries.
+function Invoke-TraceQuery {
+    param([string]$Label, [scriptblock]$Query)
+    $waits = @(60, 120, 240, 300, 300)
+    for ($i = 0; ; $i++) {
+        try { return @(& $Query) }
+        catch {
+            if ($i -ge $waits.Count -or $_.Exception.Message -notmatch 'throttl|\b429\b|too many requests|rate limit') { throw }
+            Write-Log ('  {0} throttled; waiting {1}s (retry {2} of {3})' -f $Label, $waits[$i], ($i + 1), $waits.Count) 'WARN'
+            Start-Sleep -Seconds $waits[$i]
+        }
+    }
 }
 
 function Get-ExoConnection {
@@ -466,7 +489,7 @@ Invoke-Section 'Recipients-RBAC' {
 # ===========================================================================
 $mtSkip = $(if ($SkipMessageTrace) { 'SkipMessageTrace specified' } else { $null })
 Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
-    $end = Get-Date; $start = $end.AddDays(-10)
+    $end = Get-Date
     $onPremInbound = @(Get-Safe 'Get-InboundConnector' | Where-Object { "$($_.ConnectorType)" -eq 'OnPremises' })
     $onPremIPs = @($onPremInbound | ForEach-Object { @($_.SenderIPAddresses) } | Where-Object { $_ } | ForEach-Object { "$_" })
     $onPremCerts = @($onPremInbound | ForEach-Object { "$($_.TlsSenderCertificateName)" } | Where-Object { $_ })
@@ -474,6 +497,10 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
     $agg = @{}; $daily = @{}; $total = 0
     $useV2 = [bool](Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)
     if (-not $useV2 -and -not (Get-Command Get-MessageTrace -ErrorAction SilentlyContinue)) { throw 'Neither Get-MessageTraceV2 nor Get-MessageTrace is available' }
+    $days = $MessageTraceDays
+    if (-not $useV2 -and $days -gt 10) { Write-Log '  Get-MessageTraceV2 not available (update ExchangeOnlineManagement); message trace limited to 10 days' 'WARN'; $days = 10 }
+    $start = $end.AddDays(-$days)
+    if ($days -ge 90) { $start = $start.AddHours(1) }   # stay inside the 90-day limit
     Write-Log ('  Message trace via {0}, {1:yyyy-MM-dd} .. {2:yyyy-MM-dd}' -f $(if ($useV2) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }), $start, $end)
 
     # Walk in 1-day windows to stay under result caps
@@ -484,13 +511,13 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
         do {
             try {
                 if ($useV2) {
-                    if ($page -eq 1) { $batch = @(Get-MessageTraceV2 -StartDate $cur -EndDate $next -ResultSize 5000 -ErrorAction Stop) }
+                    if ($page -eq 1) { $batch = @(Invoke-TraceQuery "Trace $($cur.ToString('yyyy-MM-dd')) page $page" { Get-MessageTraceV2 -StartDate $cur -EndDate $next -ResultSize 5000 -ErrorAction Stop }) }
                     else {
                         $last = $batch[-1]
-                        $batch = @(Get-MessageTraceV2 -StartDate $cur -EndDate $last.Received -ResultSize 5000 -StartingRecipientAddress $last.RecipientAddress -ErrorAction Stop)
+                        $batch = @(Invoke-TraceQuery "Trace $($cur.ToString('yyyy-MM-dd')) page $page" { Get-MessageTraceV2 -StartDate $cur -EndDate $last.Received -ResultSize 5000 -StartingRecipientAddress $last.RecipientAddress -ErrorAction Stop })
                     }
                 } else {
-                    $batch = @(Get-MessageTrace -StartDate $cur -EndDate $next -PageSize 5000 -Page $page -ErrorAction Stop)
+                    $batch = @(Invoke-TraceQuery "Trace $($cur.ToString('yyyy-MM-dd')) page $page" { Get-MessageTrace -StartDate $cur -EndDate $next -PageSize 5000 -Page $page -ErrorAction Stop })
                 }
             } catch { Write-Log "  Message trace page $page failed for $cur : $($_.Exception.Message)" 'WARN'; $batch = @() }
             foreach ($m in $batch) {
@@ -512,6 +539,7 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
             }
             $page++
         } while ($batch.Count -ge 5000 -and $page -le 200)
+        Write-Host ('  trace {0:yyyy-MM-dd} done ({1} messages so far)' -f $cur, $total)
         $cur = $next
     }
     $rows = @($agg.Values | ForEach-Object {
@@ -519,7 +547,7 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
     } | Sort-Object Count -Descending)
     Save-Csv $rows 'Evidence-MessageTrace-ByPath' | Out-Null
     Save-Csv @($daily.GetEnumerator() | ForEach-Object { $p = $_.Key.Split('|'); [PSCustomObject]@{ Day = $p[0]; Direction = $p[1]; Count = $_.Value } } | Sort-Object Day, Direction) 'Evidence-MessageTrace-Daily' | Out-Null
-    Save-Csv @([PSCustomObject]@{ Window = ('{0:yyyy-MM-dd HH:mm} .. {1:yyyy-MM-dd HH:mm}' -f $start, $end); Cmdlet = $(if ($useV2) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }); TotalMessages = $total; OnPremConnectorIPs = ($onPremIPs -join '; '); OnPremConnectorCerts = ($onPremCerts -join '; ') }) 'Evidence-MessageTrace-Summary' | Out-Null
+    Save-Csv @([PSCustomObject]@{ Window = ('{0:yyyy-MM-dd HH:mm} .. {1:yyyy-MM-dd HH:mm}' -f $start, $end); Cmdlet = $(if ($useV2) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }); Days = $days; TotalMessages = $total; OnPremConnectorIPs = ($onPremIPs -join '; '); OnPremConnectorCerts = ($onPremCerts -join '; ') }) 'Evidence-MessageTrace-Summary' | Out-Null
     $rows.Count
 }
 
