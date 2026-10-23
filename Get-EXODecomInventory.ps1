@@ -44,6 +44,10 @@
     Days of unified audit log to summarise. Default 90.
 .PARAMETER PublicDnsServer
     Resolver for public DNS. Default 8.8.8.8, falls back to 1.1.1.1.
+.PARAMETER OnPremIPAddress
+    Public or egress IP addresses of the on-prem Exchange servers, if known. The
+    script also resolves the host names in the hybrid connectors; addresses given
+    here are added, so message trace can mark traffic to and from on-prem.
 .PARAMETER NoZip
     Leave the output folder unzipped.
 
@@ -51,6 +55,21 @@
     .\Get-EXODecomInventory.ps1 -UserPrincipalName admin@contoso.com
 
 .NOTES
+    Version 1.3
+      Added
+      - DNS-Assessment: MXProvider (Barracuda, Mimecast, Proofpoint, Cisco, EOP, ...) and
+        AutodiscoverPointsToEXO per domain.
+      - MailFlow-GatewayAssessment: per domain, which mail gateway its MX points at, which inbound
+        connector accepts that gateway, and whether Enhanced Filtering is set on it.
+      - MailFlow-EffectiveRouting: what each outbound connector really carries, from its scope,
+        the transport rules that point at it and their state; InternalRelay domains without a route.
+      - Message trace FromClass / ToClass (on-prem Exchange, mail gateway, Microsoft, EXO-generated,
+        other) and Evidence-MessageTrace-ByRoute.
+      - Recipients-PublicFolderMailboxes: name, size, items and last logon of each public folder
+        mailbox in Exchange Online.
+      Fixed
+      - ViaOnPrem in the message trace was always empty when the hybrid connector authenticates by
+        certificate; on-prem addresses are now resolved from the connector host names.
     Version 1.2
       - Message trace covers up to 90 days (default) through Get-MessageTraceV2, saved locally,
         with automatic waits when Microsoft throttles the queries. -MessageTraceDays sets the window.
@@ -85,6 +104,7 @@ param(
     [switch]$SkipCompliance,
     [int]$AuditDays = 90,
     [string]$PublicDnsServer = '8.8.8.8',
+    [string[]]$OnPremIPAddress,
     [switch]$NoZip
 )
 
@@ -92,7 +112,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 $WarningPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
-$script:ScriptVersion = '1.2'
+$script:ScriptVersion = '1.3'
 $script:StartTime = Get-Date
 
 # ---------------------------------------------------------------------------
@@ -222,6 +242,79 @@ function Invoke-TraceQuery {
             Start-Sleep -Seconds $waits[$i]
         }
     }
+}
+
+# Dotted IPv4 -> number (int64), or -1 when not an IPv4 address
+function ConvertTo-Ip4Number {
+    param([string]$Ip)
+    if ("$Ip" -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return [int64]-1 }
+    $o = @([int64]$Matches[1], [int64]$Matches[2], [int64]$Matches[3], [int64]$Matches[4])
+    if (@($o | Where-Object { $_ -gt 255 }).Count) { return [int64]-1 }
+    ($o[0] * 16777216) + ($o[1] * 65536) + ($o[2] * 256) + $o[3]
+}
+
+# IPv4 CIDR ("1.2.3.0/24", "1.2.3.4", "1.2.3.4-1.2.3.9") -> @{ Lo; Hi }, $null for anything else
+function ConvertTo-Ip4Range {
+    param([string]$Text)
+    $t = "$Text".Trim()
+    if ($t -match '^(\d+\.\d+\.\d+\.\d+)/(\d+)$') {
+        $n = ConvertTo-Ip4Number $Matches[1]; $bits = [int]$Matches[2]
+        if ($n -lt 0 -or $bits -gt 32) { return $null }
+        $size = [int64]1 -shl (32 - $bits)
+        $lo = $n - ($n % $size)
+        return @{ Lo = $lo; Hi = $lo + $size - 1 }
+    }
+    if ($t -match '^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$') {
+        $a = ConvertTo-Ip4Number $Matches[1]; $b = ConvertTo-Ip4Number $Matches[2]
+        if ($a -ge 0 -and $b -ge $a) { return @{ Lo = $a; Hi = $b } }
+        return $null
+    }
+    $n = ConvertTo-Ip4Number $t
+    if ($n -ge 0) { return @{ Lo = $n; Hi = $n } }
+    $null
+}
+
+function Test-Ip4InRanges {
+    param([string]$Ip, [object[]]$Ranges)
+    $n = ConvertTo-Ip4Number $Ip
+    if ($n -lt 0 -or -not $Ranges) { return $false }
+    foreach ($r in $Ranges) { if ($n -ge $r.Lo -and $n -le $r.Hi) { return $true } }
+    $false
+}
+
+# Mail gateway behind an MX or smart host name
+function Get-MxProvider {
+    param([string]$HostName)
+    $h = "$HostName".ToLower().TrimEnd('.')
+    switch -Regex ($h) {
+        'mail\.protection\.outlook\.com$' { return 'Exchange Online Protection' }
+        '\.ess\.barracudanetworks\.com$|\.barracudanetworks\.com$' { return 'Barracuda Email Gateway Defense' }
+        'mimecast' { return 'Mimecast' }
+        'pphosted\.com$|ppe-hosted\.com$|proofpoint' { return 'Proofpoint' }
+        'iphmx\.com$' { return 'Cisco Secure Email' }
+        'messagelabs\.com$' { return 'Broadcom Email Security.cloud' }
+        'trendmicro|tmes\.' { return 'Trend Micro' }
+        'sophos' { return 'Sophos' }
+        'google\.com$|googlemail\.com$' { return 'Google' }
+        default { if ($h) { return 'Other (on-prem or unrecognised)' } }
+    }
+    ''
+}
+
+# A records for a host name (public resolver first), empty on failure
+function Resolve-HostIp {
+    param([string]$Name)
+    $n = "$Name".Trim().TrimEnd('.')
+    if (-not $n -or $n -match '^\d+\.\d+\.\d+\.\d+$') { return @($n | Where-Object { $_ }) }
+    if ($n.StartsWith('*.')) { return @() }
+    foreach ($srv in @($PublicDnsServer, $null)) {
+        try {
+            $a = @{ Name = $n; Type = 'A'; DnsOnly = $true; ErrorAction = 'Stop' }; if ($srv) { $a.Server = $srv }
+            $ips = @(Resolve-DnsName @a | Where-Object { "$($_.Type)" -eq 'A' } | ForEach-Object { "$($_.IPAddress)" })
+            if ($ips.Count) { return $ips }
+        } catch { }
+    }
+    @()
 }
 
 function Get-ExoConnection {
@@ -383,6 +476,7 @@ Invoke-Section 'MailFlow-Connectors' {
         }
     }
     Save-Csv @($orows) 'MailFlow-OutboundConnectors' | Out-Null
+    $script:InboundConnectors = $inb; $script:OutboundConnectors = $outb
     $cmt = @($orows | Where-Object { "$($_.RouteAllMessagesViaOnPremises)" -eq 'True' })
     Save-Csv @([PSCustomObject]@{ CentralizedMailTransportEnabled = ($cmt.Count -gt 0); ConnectorsWithRouteAllViaOnPrem = (($cmt | ForEach-Object { $_.Name }) -join '; '); InboundOnPremConnectors = @($rows | Where-Object { "$($_.ConnectorType)" -eq 'OnPremises' }).Count; OutboundOnPremConnectors = @($orows | Where-Object { "$($_.ConnectorType)" -eq 'OnPremises' }).Count }) 'MailFlow-Connectors-Summary' | Out-Null
     @($rows).Count + @($orows).Count
@@ -390,7 +484,8 @@ Invoke-Section 'MailFlow-Connectors' {
 
 Invoke-Section 'MailFlow-Rules' {
     $n = 0
-    $n += Save-Csv @(Get-Safe 'Get-TransportRule' @{ ResultSize = 'Unlimited' } | Select-Object Name, State, Priority, Mode, Description, RouteMessageOutboundConnector, WhenChanged) 'MailFlow-TransportRules'
+    $script:TransportRules = @(Get-Safe 'Get-TransportRule' @{ ResultSize = 'Unlimited' })
+    $n += Save-Csv @($script:TransportRules | Select-Object Name, State, Priority, Mode, Description, RouteMessageOutboundConnector, WhenChanged) 'MailFlow-TransportRules'
     $n += Save-Csv @(Get-Safe 'Get-JournalRule') 'MailFlow-JournalRules'
     $n += Save-Csv @(Get-Safe 'Get-TransportConfig' | Select-Object JournalingReportNdrTo, MaxSendSize, MaxReceiveSize, MaxRecipientEnvelopeLimit, ExternalPostmasterAddress, SmtpClientAuthenticationDisabled, AllowLegacyTLSClients, HeaderPromotionModeSetting) 'MailFlow-TransportConfig'
     $n += Save-Csv @(Get-Safe 'Get-DkimSigningConfig' | Select-Object Domain, Enabled, Status, Selector1CNAME, Selector2CNAME, SelectorBeforeRotateOnDate, SelectorAfterRotateOnDate, LastChecked, WhenChanged) 'MailFlow-DkimSigningConfig'
@@ -400,6 +495,41 @@ Invoke-Section 'MailFlow-Rules' {
     $n += Save-Csv @(Get-Safe 'Get-EOPProtectionPolicyRule') 'MailFlow-EOPProtectionPolicyRules'
     $n += Save-Csv @(Get-Safe 'Get-TenantAllowBlockListItems' @{ ListType = 'Sender' }) 'MailFlow-TenantAllowBlockList-Sender'
     $n
+}
+
+# What each outbound connector actually carries. A connector that only a transport rule can select
+# (IsTransportRuleScoped) carries nothing unless an enabled rule routes to it; "centralized mail
+# transport" on such a connector is configuration, not mail flow.
+Invoke-Section 'MailFlow-EffectiveRouting' {
+    $rules = @($script:TransportRules)
+    $rows = foreach ($c in @($script:OutboundConnectors)) {
+        $refs = @($rules | Where-Object { "$($_.RouteMessageOutboundConnector)" -eq "$($c.Name)" })
+        $enabledRefs = @($refs | Where-Object { "$($_.State)" -eq 'Enabled' -and "$($_.Mode)" -eq 'Enforce' })
+        $domains = (@($c.RecipientDomains) | ForEach-Object { "$_" }) -join '; '
+        $effective = $(if (-not $c.Enabled) { 'Disabled' }
+            elseif ("$($c.TestMode)" -eq 'True') { 'Test mode only' }
+            elseif ($c.IsTransportRuleScoped) { $(if ($enabledRefs.Count) { 'Used by enabled rule(s)' } else { 'Rule-scoped with no enabled rule: carries no mail' }) }
+            elseif ("$($c.AllAcceptedDomains)" -eq 'True') { 'All accepted domains' }
+            elseif ($domains) { "Recipient domains: $domains" }
+            else { 'No scope' })
+        [PSCustomObject]@{
+            Name = $c.Name; ConnectorType = $c.ConnectorType; Enabled = $c.Enabled; TestMode = $c.TestMode; IsTransportRuleScoped = $c.IsTransportRuleScoped
+            RecipientDomains = $domains; SmartHosts = (@($c.SmartHosts) | ForEach-Object { "$_" }) -join '; '
+            SmartHostProvider = (@($c.SmartHosts) | ForEach-Object { Get-MxProvider "$_" } | Sort-Object -Unique) -join '; '
+            RouteAllMessagesViaOnPremises = $c.RouteAllMessagesViaOnPremises
+            RulesReferencing = (@($refs | ForEach-Object { "$($_.Name) [$($_.State)/$($_.Mode)]" }) -join '; ')
+            EffectiveUse = $effective
+        }
+    }
+    Save-Csv @($rows) 'MailFlow-EffectiveRouting' | Out-Null
+    # InternalRelay domains: unknown recipients leave by MX; without a connector they can loop back via the gateway
+    $relay = foreach ($d in @($script:AcceptedDomains | Where-Object { "$($_.DomainType)" -eq 'InternalRelay' })) {
+        $dn = "$($d.DomainName)".ToLower()
+        $cover = @($rows | Where-Object { $_.Enabled -and -not $_.IsTransportRuleScoped -and ($_.EffectiveUse -eq 'All accepted domains' -or (" $($_.RecipientDomains); " -match [regex]::Escape(" $dn;") -or $_.RecipientDomains -eq '*')) })
+        [PSCustomObject]@{ Domain = $dn; DomainType = 'InternalRelay'; CoveringConnectors = (($cover | ForEach-Object { $_.Name }) -join '; '); Note = $(if ($cover.Count) { '' } else { 'No outbound connector routes unknown recipients for this domain; they leave by MX' }) }
+    }
+    Save-Csv @($relay) 'MailFlow-InternalRelayRouting' | Out-Null
+    @($rows).Count
 }
 
 Invoke-Section 'MailFlow-Auth' {
@@ -464,6 +594,19 @@ Invoke-Section 'Recipients-PublicFolders' {
         MailEnabledPublicFolderCount = @(Get-Safe 'Get-MailPublicFolder' @{ ResultSize = 'Unlimited' }).Count
     }) 'Recipients-PublicFolders' | Out-Null
     Save-Csv @(Get-Safe 'Get-PublicFolderMigrationRequest') 'Recipients-PublicFolderMigrationRequests' | Out-Null
+    # Each public folder mailbox in Exchange Online: empty hierarchy-only mailboxes vs real content
+    $pfm = foreach ($m in @(Get-Safe 'Get-Mailbox' @{ PublicFolder = $true; ResultSize = 'Unlimited' })) {
+        $st = $null
+        try { $st = Get-MailboxStatistics -Identity "$($m.ExchangeGuid)" -ErrorAction Stop } catch { }
+        [PSCustomObject]@{
+            Name = $m.Name; DisplayName = $m.DisplayName; ExchangeGuid = $m.ExchangeGuid
+            IsRootPublicFolderMailbox = ("$($m.ExchangeGuid)" -eq "$($o.RootPublicFolderMailbox)")
+            IsExcludedFromServingHierarchy = $m.IsExcludedFromServingHierarchy
+            ItemCount = $(if ($st) { $st.ItemCount } else { '' }); TotalItemSize = $(if ($st) { $st.TotalItemSize } else { '' })
+            LastLogonTime = $(if ($st) { $st.LastLogonTime } else { '' }); WhenCreated = $m.WhenCreated
+        }
+    }
+    Save-Csv @($pfm) 'Recipients-PublicFolderMailboxes' | Out-Null
     1
 }
 
@@ -493,6 +636,46 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
     $onPremInbound = @(Get-Safe 'Get-InboundConnector' | Where-Object { "$($_.ConnectorType)" -eq 'OnPremises' })
     $onPremIPs = @($onPremInbound | ForEach-Object { @($_.SenderIPAddresses) } | Where-Object { $_ } | ForEach-Object { "$_" })
     $onPremCerts = @($onPremInbound | ForEach-Object { "$($_.TlsSenderCertificateName)" } | Where-Object { $_ })
+
+    # Address classes for FromIP / ToIP. Hybrid connectors usually authenticate by certificate, so the
+    # on-prem addresses come from resolving the connector host names (plus -OnPremIPAddress).
+    $onPremHosts = @($onPremCerts | ForEach-Object { $_ -replace '^\*\.', '' })
+    $onPremHosts += @(@($script:OutboundConnectors) | Where-Object { "$($_.ConnectorType)" -eq 'OnPremises' -and -not $_.TestMode } | ForEach-Object { @($_.SmartHosts) | ForEach-Object { "$_" } })
+    $onPremHosts += @(Get-Safe 'Get-IntraOrganizationConnector' | ForEach-Object { try { ([uri]"$($_.DiscoveryEndpoint)").Host } catch { } })
+    $onPremHosts = @($onPremHosts | Where-Object { $_ -and $_ -notmatch '(?i)outlook\.com$|msappproxy\.net$|office365\.com$' } | Sort-Object -Unique)
+    $onPremAddr = @(@($onPremIPs) + @($OnPremIPAddress) + @($onPremHosts | ForEach-Object { Resolve-HostIp $_ }) | Where-Object { $_ } | Sort-Object -Unique)
+    $onPremRanges = @($onPremAddr | ForEach-Object { ConvertTo-Ip4Range $_ } | Where-Object { $_ })
+    Write-Log ('  On-prem addresses for trace classification: {0} (from {1})' -f ($onPremAddr -join ', '), ($onPremHosts -join ', '))
+    $gw = @()
+    foreach ($c in @($script:InboundConnectors | Where-Object { "$($_.ConnectorType)" -eq 'Partner' })) {
+        $r = @(@($c.SenderIPAddresses) | ForEach-Object { ConvertTo-Ip4Range "$_" } | Where-Object { $_ })
+        if ($r.Count) { $gw += @{ Name = "$($c.Name)"; Ranges = $r } }
+    }
+    foreach ($c in @($script:OutboundConnectors | Where-Object { "$($_.ConnectorType)" -eq 'Partner' -and $_.Enabled })) {
+        $r = @(@($c.SmartHosts) | ForEach-Object { Resolve-HostIp "$_" } | ForEach-Object { ConvertTo-Ip4Range $_ } | Where-Object { $_ })
+        if ($r.Count) { $gw += @{ Name = "$($c.Name)"; Ranges = $r } }
+    }
+    $msRanges = @()
+    try {
+        $ep = Invoke-RestMethod -Uri ('https://endpoints.office.com/endpoints/worldwide?clientrequestid={0}' -f [guid]::NewGuid()) -TimeoutSec 20 -ErrorAction Stop
+        $msRanges = @($ep | Where-Object { $_.serviceArea -eq 'Exchange' -and $_.ips } | ForEach-Object { $_.ips } | Where-Object { $_ -notmatch ':' } | Sort-Object -Unique | ForEach-Object { ConvertTo-Ip4Range $_ } | Where-Object { $_ })
+    } catch { Write-Log '  Microsoft 365 IP list not downloaded; Microsoft addresses are classified by IPv6 prefix only' 'WARN' }
+    $clsCache = @{}
+    $classOf = {
+        param($ip)
+        if (-not $ip -or $ip -eq '255.255.255.255') { return 'EXO-generated' }
+        $cl = 'Other'
+        if (Test-Ip4InRanges $ip $onPremRanges) { $cl = 'OnPremExchange' }
+        else {
+            foreach ($g in $gw) { if (Test-Ip4InRanges $ip $g.Ranges) { $cl = "Gateway:$($g.Name)"; break } }
+            if ($cl -eq 'Other') {
+                if ($ip -match '^(?i)2a01:111:|^2603:10[0-9a-f]{2}:' -or (Test-Ip4InRanges $ip $msRanges)) { $cl = 'Microsoft' }
+                elseif ($ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)') { $cl = 'Private' }
+            }
+        }
+        $clsCache[$ip] = $cl
+        $cl
+    }
 
     $agg = @{}; $daily = @{}; $total = 0
     $useV2 = [bool](Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)
@@ -527,9 +710,13 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
                 $toInternal = ($script:AcceptedDomainNames -contains "$($m.RecipientAddress)".Split('@')[-1].ToLower())
                 $dir = $(if ($fromInternal -and $toInternal) { 'Internal' } elseif ($fromInternal) { 'Outbound' } elseif ($toInternal) { 'Inbound' } else { 'Other' })
                 $fromIp = "$($m.FromIP)"; $toIp = "$($m.ToIP)"
-                $viaOnPrem = $(if ($onPremIPs -contains $fromIp) { 'FromOnPremIP' } else { '' })
                 $k = "$dir|$fromIp|$toIp|$($m.Status)"
-                if (-not $agg.ContainsKey($k)) { $agg[$k] = @{ Direction = $dir; FromIP = $fromIp; ToIP = $toIp; Status = "$($m.Status)"; Count = 0; SenderDomains = @{}; RecipientDomains = @{}; First = $m.Received; Last = $m.Received; ViaOnPrem = $viaOnPrem } }
+                if (-not $agg.ContainsKey($k)) {
+                    $fc = $(if ($clsCache.ContainsKey($fromIp)) { $clsCache[$fromIp] } else { & $classOf $fromIp })
+                    $tc = $(if (-not $toIp) { '' } elseif ($clsCache.ContainsKey($toIp)) { $clsCache[$toIp] } else { & $classOf $toIp })
+                    $viaOnPrem = (@($(if ($fc -eq 'OnPremExchange') { 'FromOnPrem' }), $(if ($tc -eq 'OnPremExchange') { 'ToOnPrem' }) | Where-Object { $_ }) -join '+')
+                    $agg[$k] = @{ Direction = $dir; FromIP = $fromIp; ToIP = $toIp; FromClass = $fc; ToClass = $tc; Status = "$($m.Status)"; Count = 0; SenderDomains = @{}; RecipientDomains = @{}; First = $m.Received; Last = $m.Received; ViaOnPrem = $viaOnPrem }
+                }
                 $a = $agg[$k]; $a.Count++
                 $sd = "$($m.SenderAddress)".Split('@')[-1].ToLower(); if ($sd -and $a.SenderDomains.Count -lt 20) { $a.SenderDomains[$sd] = 1 }
                 $rd = "$($m.RecipientAddress)".Split('@')[-1].ToLower(); if ($rd -and $a.RecipientDomains.Count -lt 20) { $a.RecipientDomains[$rd] = 1 }
@@ -543,9 +730,20 @@ Invoke-Section 'Evidence-MessageTrace' -SkipReason $mtSkip -Script {
         $cur = $next
     }
     $rows = @($agg.Values | ForEach-Object {
-        [PSCustomObject]@{ Direction = $_.Direction; FromIP = $_.FromIP; ToIP = $_.ToIP; ViaOnPrem = $_.ViaOnPrem; Status = $_.Status; Count = $_.Count; FirstSeen = $_.First; LastSeen = $_.Last; SenderDomains = ($_.SenderDomains.Keys -join '; '); RecipientDomains = ($_.RecipientDomains.Keys -join '; ') }
+        [PSCustomObject]@{ Direction = $_.Direction; FromIP = $_.FromIP; FromClass = $_.FromClass; ToIP = $_.ToIP; ToClass = $_.ToClass; ViaOnPrem = $_.ViaOnPrem; Status = $_.Status; Count = $_.Count; FirstSeen = $_.First; LastSeen = $_.Last; SenderDomains = ($_.SenderDomains.Keys -join '; '); RecipientDomains = ($_.RecipientDomains.Keys -join '; ') }
     } | Sort-Object Count -Descending)
     Save-Csv $rows 'Evidence-MessageTrace-ByPath' | Out-Null
+    # Route summary: how much mail enters from the gateway, leaves through it, or touches on-prem
+    $route = @($rows | Group-Object Direction, FromClass, ToClass | ForEach-Object {
+        $g = $_.Group
+        [PSCustomObject]@{
+            Direction = $g[0].Direction; FromClass = $g[0].FromClass; ToClass = $g[0].ToClass
+            Messages = ($g | Measure-Object Count -Sum).Sum
+            ByStatus = (@($g | Group-Object Status | ForEach-Object { '{0}={1}' -f $_.Name, ($_.Group | Measure-Object Count -Sum).Sum }) -join '; ')
+            DistinctFromIPs = @($g | Select-Object -ExpandProperty FromIP -Unique).Count
+        }
+    } | Sort-Object Messages -Descending)
+    Save-Csv $route 'Evidence-MessageTrace-ByRoute' | Out-Null
     Save-Csv @($daily.GetEnumerator() | ForEach-Object { $p = $_.Key.Split('|'); [PSCustomObject]@{ Day = $p[0]; Direction = $p[1]; Count = $_.Value } } | Sort-Object Day, Direction) 'Evidence-MessageTrace-Daily' | Out-Null
     Save-Csv @([PSCustomObject]@{ Window = ('{0:yyyy-MM-dd HH:mm} .. {1:yyyy-MM-dd HH:mm}' -f $start, $end); Cmdlet = $(if ($useV2) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }); Days = $days; TotalMessages = $total; OnPremConnectorIPs = ($onPremIPs -join '; '); OnPremConnectorCerts = ($onPremCerts -join '; ') }) 'Evidence-MessageTrace-Summary' | Out-Null
     $rows.Count
@@ -604,6 +802,7 @@ function Resolve-Rec {
     } catch { [PSCustomObject]@{ View = $View; Name = $Name; Type = $Type; Value = ''; TTL = ''; Status = $_.Exception.Message } }
 }
 
+$script:DnsAssessment = @()
 Invoke-Section 'DNS-Records' {
     if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) { throw 'Resolve-DnsName not available on this system (Windows only)' }
     $pub = $null
@@ -639,15 +838,49 @@ Invoke-Section 'DNS-Records' {
         $s1 = "$(($pr | Where-Object { $_.Name -eq "selector1._domainkey.$d" -and $_.Value } | Select-Object -First 1).Value)"
         $dk = $dkim[$d]
         [PSCustomObject]@{
-            Domain = $d; View = $viewPrefix.TrimEnd('*'); MX = $mx; MXPointsToEOP = ($mx -match 'mail\.protection\.outlook\.com'); SPF = $spf; SPFIncludesEOP = ($spf -match 'spf\.protection\.outlook\.com'); SPFHasIp4OrA = ($spf -match 'ip4:|\sa[\s:]|\smx')
+            Domain = $d; View = $viewPrefix.TrimEnd('*'); MX = $mx; MXPointsToEOP = ($mx -match 'mail\.protection\.outlook\.com')
+            MXProvider = ((@($mx -split '; ') | Where-Object { $_ } | ForEach-Object { Get-MxProvider (($_ -split ' ')[-1]) } | Sort-Object -Unique) -join '; ')
+            SPF = $spf; SPFIncludesEOP = ($spf -match 'spf\.protection\.outlook\.com'); SPFHasIp4OrA = ($spf -match 'ip4:|\sa[\s:]|\smx')
             DKIM_PublishedSelector1 = $s1; DKIM_ExpectedSelector1 = $(if ($dk) { "$($dk.Selector1CNAME)" } else { '' }); DKIM_EnabledInEXO = $(if ($dk) { $dk.Enabled } else { 'NoConfig' })
             DKIM_Match = $(if ($dk -and $s1) { ($s1.TrimEnd('.') -eq "$($dk.Selector1CNAME)".TrimEnd('.')) } else { '' })
             DMARC = "$(($pr | Where-Object { $_.Name -eq "_dmarc.$d" -and $_.Value } | Select-Object -First 1).Value)"
             AutodiscoverPublic = (@($pr | Where-Object { $_.Name -eq "autodiscover.$d" -and $_.Value } | ForEach-Object { $_.Value }) -join '; ')
+            AutodiscoverPointsToEXO = [bool]@($pr | Where-Object { $_.Name -eq "autodiscover.$d" -and $_.Type -eq 'CNAME' -and $_.Value -match '(?i)autodiscover\.outlook\.com' }).Count
         }
     }
     Save-Csv @($assess) 'DNS-Assessment' | Out-Null
+    $script:DnsAssessment = @($assess)
     @($rows).Count
+}
+
+# Which mail gateway each domain's MX points at, and how Exchange Online accepts mail from it.
+# With a third-party gateway first, EOP sees the gateway's IP unless Enhanced Filtering (skip
+# listing) is set on the inbound connector, and the decom must keep that connector, not the hybrid one.
+Invoke-Section 'MailFlow-GatewayAssessment' {
+    $partner = @($script:InboundConnectors | Where-Object { "$($_.ConnectorType)" -eq 'Partner' -and $_.Enabled })
+    $outPartner = @($script:OutboundConnectors | Where-Object { "$($_.ConnectorType)" -eq 'Partner' -and $_.Enabled -and -not $_.TestMode })
+    $rows = foreach ($a in @($script:DnsAssessment)) {
+        $prov = "$($a.MXProvider)"
+        $thirdParty = ($prov -and $prov -notmatch 'Exchange Online Protection')
+        $inMatch = @($partner | Where-Object { $n = "$($_.Name) $($_.Comment)"; ($prov -match 'Barracuda' -and $n -match '(?i)barracuda') -or ($prov -match 'Mimecast' -and $n -match '(?i)mimecast') -or ($prov -match 'Proofpoint' -and $n -match '(?i)proofpoint') -or ($prov -match 'Cisco' -and $n -match '(?i)cisco|ironport') })
+        if ($thirdParty -and -not $inMatch.Count) { $inMatch = $partner }
+        $ef = @($inMatch | Where-Object { "$($_.EFSkipLastIP)" -eq 'True' -or @($_.EFSkipIPs).Count })
+        $outMatch = @()
+        if ($thirdParty) { $first = [regex]::Escape(($prov -split '; ')[0]); $outMatch = @($outPartner | Where-Object { ((@($_.SmartHosts) | ForEach-Object { Get-MxProvider "$_" }) -join ' ') -match $first }) }
+        $notes = @()
+        if ($thirdParty -and -not $inMatch.Count) { $notes += 'MX is a third-party gateway but no enabled Partner inbound connector exists' }
+        if ($thirdParty -and $inMatch.Count -and -not $ef.Count) { $notes += 'Enhanced Filtering not configured on the gateway connector; EOP evaluates SPF/DMARC against the gateway IP' }
+        if ($prov -match 'Other') { $notes += 'MX is not a recognised cloud gateway; check whether it is on-prem Exchange or an on-prem appliance' }
+        [PSCustomObject]@{
+            Domain = $a.Domain; MX = $a.MX; MXProvider = $prov
+            InboundConnectors = (($inMatch | ForEach-Object { "$($_.Name) [IPs: $((@($_.SenderIPAddresses) -join ', '))]" }) -join '; ')
+            InboundRestrictedToIPs = (($inMatch | ForEach-Object { "$($_.RestrictDomainsToIPAddresses)" } | Sort-Object -Unique) -join '; ')
+            EnhancedFiltering = $(if ($ef.Count) { 'Configured' } elseif ($thirdParty) { 'Not configured' } else { 'n/a' })
+            OutboundViaGateway = (($outMatch | ForEach-Object { "$($_.Name) -> $((@($_.SmartHosts) -join ', '))" }) -join '; ')
+            Notes = ($notes -join ' | ')
+        }
+    }
+    Save-Csv @($rows) 'MailFlow-GatewayAssessment'
 }
 
 # ===========================================================================

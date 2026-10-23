@@ -1,0 +1,7 @@
+# Inventory output contains customer names, addresses and configuration; never commit it
+DecomInventory_*/
+DecomInventory_*.zip
+*.csv
+RunLog.txt
+Transcript.txt
+RunInfo.json

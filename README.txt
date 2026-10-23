@@ -40,6 +40,16 @@ most of it. Keep the window open. To shorten it:
 
 Message subjects are not collected unless -IncludeSubjects is added.
 
+Forests that trust this one are also checked for Exchange objects and Autodiscover
+records. If the run account cannot read another forest (Findings.csv says so), add
+a credential for it:
+          .\Get-ExchOnPremDecomInventory.ps1 -ForestCredential (Get-Credential)
+To name a forest that has no trust to this one:
+          .\Get-ExchOnPremDecomInventory.ps1 -TrustedForest accounts.example.local
+
+Findings.csv summarises what the evidence shows (unused connectors, failing relay
+sources, names on the DAG cluster address, other Exchange organizations, and so on).
+
 
 2. Entra Connect
 ----------------
